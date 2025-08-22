@@ -2,7 +2,7 @@
 
 ## Project Organization
 
-![image-20250822150813650](C:\Users\86198\AppData\Roaming\Typora\typora-user-images\image-20250822150813650.png)
+![image-20250822150813650](./image-20250822150813650.png)
 
 **Experiments**:
 
@@ -68,7 +68,7 @@ python tools/test.py ./configs/train_cfg.py --work-dir /data2/607_LRK_dataset/ru
 
 **Visualization effect**
 
-![image-20250822150913329](C:\Users\86198\AppData\Roaming\Typora\typora-user-images\image-20250822150913329.png)
+![image-20250822150913329](./image-20250822150913329.png)
 
 ## Contact
 
