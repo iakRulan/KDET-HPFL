@@ -414,83 +414,89 @@ class MergeBlockMaskedEmbed(MergeBlock):
             x = innerforword(x)
         return x
 
-class MoELayer(nn.Module):
-    def __init__(self, num_experts=4, expert_type='linear', with_spatial=True):
-        super(MoELayer, self).__init__()
+
+
+class CrossStageMoELayer(nn.Module):
+    def __init__(self, input_dim, output_dim, num_experts=4, expert_type='linear', with_spatial=True):
+        super(CrossStageMoELayer, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
         self.num_experts = num_experts
         self.with_spatial = with_spatial
         self.expert_type = expert_type
         self.experts = None
         self.gate = None
         self.embed_dim = None
+        self.input_proj = None
         
-    def _init_networks(self, embed_dim):
+    def _init_networks(self, input_dim, output_dim):
         """动态初始化专家网络和门控网络"""
         if self.experts is None:
-            self.embed_dim = embed_dim
+            self.input_dim = input_dim
+            self.output_dim = output_dim
             
-            # 初始化专家网络
+            if input_dim != output_dim:
+                self.input_proj = nn.Linear(input_dim, output_dim)
+            
             if self.expert_type == 'linear':
                 self.experts = nn.ModuleList([
-                    nn.Linear(embed_dim, embed_dim) 
+                    nn.Linear(output_dim, output_dim) 
                     for _ in range(self.num_experts)
                 ])
             else:
                 raise NotImplementedError("Only linear experts are implemented in this example.")
             
-            # 初始化门控网络
             self.gate = nn.Sequential(
-                nn.Linear(embed_dim, embed_dim // 2),
+                nn.Linear(output_dim, output_dim // 2),
                 nn.ReLU(),
-                nn.Linear(embed_dim // 2, self.num_experts)
+                nn.Linear(output_dim // 2, self.num_experts)
             )
-
+    
     def forward(self, x, x_ir):
-        # 确保输入在同一设备上
         device = x.device
         
-        # 在第一次前向传播时初始化网络
         if self.experts is None:
-            self._init_networks(x.shape[-1])
+            self._init_networks(x.shape[-1], self.output_dim)
         
         self.to(device)  # 将整个模块移到与输入相同的设备上
-   
-        B, N, C = x.shape
-        # 对x做一个全局均值池化（对N取平均），得到[B, C]
-        global_x = x.mean(dim=1)  # [B, C]
         
-        # 通过门控网络获得对于num_experts个专家的权重
+        B, N, C = x.shape
+        
+        # 维度投影（如果需要）
+        if self.input_proj is not None:
+            x = self.input_proj(x)      # [B, N, output_dim]
+            x_ir = self.input_proj(x_ir)  # [B, N, output_dim]
+        
+        global_x = x.mean(dim=1)  # [B, output_dim]
+        
         gating_weights = self.gate(global_x)  # [B, num_experts]
         gating_weights = F.softmax(gating_weights, dim=-1)  # softmax归一化
         
-        # 将专家应用到x和x_ir上
         expert_outputs_x = []
         expert_outputs_x_ir = []
         for expert in self.experts:
             # 对x和x_ir分别通过专家处理
-            out_x = expert(x)      # [B, N, C]
+            out_x = expert(x)      # [B, N, output_dim]
             out_x_ir = expert(x_ir)
-            expert_outputs_x.append(out_x.unsqueeze(0))        # [1, B, N, C]
-            expert_outputs_x_ir.append(out_x_ir.unsqueeze(0))  # [1, B, N, C]
+            expert_outputs_x.append(out_x.unsqueeze(0))        # [1, B, N, output_dim]
+            expert_outputs_x_ir.append(out_x_ir.unsqueeze(0))  # [1, B, N, output_dim]
             
-        # 将专家输出堆叠: [num_experts, B, N, C]
         expert_outputs_x = torch.cat(expert_outputs_x, dim=0)
         expert_outputs_x_ir = torch.cat(expert_outputs_x_ir, dim=0)
         
-        # gating_weights扩展维度以匹配专家输出
         gating_weights = gating_weights.view(B, self.num_experts, 1, 1)  # [B, num_experts, 1, 1]
         
-        # 转置并加权求和
-        expert_outputs_x = expert_outputs_x.permute(1, 0, 2, 3)     # [B, num_experts, N, C]
-        expert_outputs_x_ir = expert_outputs_x_ir.permute(1, 0, 2, 3) # [B, num_experts, N, C]
+        expert_outputs_x = expert_outputs_x.permute(1, 0, 2, 3)     # [B, num_experts, N, output_dim]
+        expert_outputs_x_ir = expert_outputs_x_ir.permute(1, 0, 2, 3) # [B, num_experts, N, output_dim]
         
-        moe_out_x = (expert_outputs_x * gating_weights).sum(dim=1)      # [B, N, C]
-        moe_out_x_ir = (expert_outputs_x_ir * gating_weights).sum(dim=1)# [B, N, C]
+        moe_out_x = (expert_outputs_x * gating_weights).sum(dim=1)      # [B, N, output_dim]
+        moe_out_x_ir = (expert_outputs_x_ir * gating_weights).sum(dim=1)# [B, N, output_dim]
         
         return moe_out_x, moe_out_x_ir
-    
+
+
 @BACKBONES.register_module()
-class KDET(DualVit):
+class KEDT(DualVit):
 
     def __init__(self,
                  stem_width=32,
@@ -506,6 +512,8 @@ class KDET(DualVit):
                  num_scores=2,
                  mod_nums=1,
                  with_cp=False,
+                 num_experts=4,
+                 expert_capacity='linear',
                  pretrained=None):
         super().__init__()
 
@@ -519,16 +527,23 @@ class KDET(DualVit):
 
         self.sep_stage = 2
         
-        self.moe_layers = nn.ModuleList([
-            MoELayer(num_experts=4, 
-                    expert_type='linear')
-            for _ in range(num_stages)
+        self.cross_stage_moe_layers = nn.ModuleList([
+            CrossStageMoELayer(
+                input_dim=embed_dims[i],     # 当前stage的输出维度
+                output_dim=embed_dims[i+1],  # 下一个stage的输入维度
+                num_experts=num_experts,
+                expert_type='linear'
+            )
+            for i in range(num_stages - 1)  # 0->1, 1->2, 2->3
         ])
+        
+        self.cross_stage_weights = nn.Parameter(torch.ones(num_stages-1) * 0.1)
+        
         dpr = [
             x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))
         ]
         cur = 0
-
+        
         for i in range(num_stages):
             if i == 0:
                 patch_embed = Stem(in_chans, stem_width, embed_dims[i])
@@ -661,10 +676,6 @@ class KDET(DualVit):
 
         attn_self_q = (attn_self_q @ kv[0].transpose(-1, -2)) * self.scale
 
-        attn_self_q = get_masked_attn_output_weights(
-            attn_self_q, bsz=bsz, num_heads=1, tgt_len=M, src_len=src_len,
-            attn_mask=attn_mask, key_padding_mask=key_padding_mask)
-
         attn_self_q = attn_self_q.softmax(-1)  # B, M, N
         semantics = attn_self_q @ kv[1]  # B, M, C
         semantics = semantics.view(B, -1, C)
@@ -682,12 +693,12 @@ class KDET(DualVit):
         return semantics
 
     def forward_sep(self, x, x_ir, x_weight, x_ir_weight):
-
         B = x.shape[0]
         outs = []
+        stage_residuals = {}  # 存储每个stage最后一个block的输出
+        
         score_start_idx = 0
         score_end_idx = score_start_idx + self.score_embed_nums
-
         mod_emb_end_idx = score_end_idx + self.mod_nums
 
         for i in range(self.sep_stage):
@@ -728,10 +739,6 @@ class KDET(DualVit):
                         inner_get_semantics, semantics)
                 else:
                     semantics = inner_get_semantics(semantics)
-            # print(score_embed.shape)
-            # print(mod_embed.shape)
-            # print(x.shape)
-            # print(x_ir.shape)
 
             x = torch.cat([score_embed, mod_embed, x, x_ir], dim=1)
 
@@ -748,8 +755,8 @@ class KDET(DualVit):
                 key_padding_mask[:,
                                  self.extra_token_num:total_patches] = True
 
-            for blk in block:
-
+            # 处理每个block
+            for j, blk in enumerate(block):
                 if self.with_cp:
                     x, semantics = blk(x, H_tensor, W_tensor, semantics,
                                        self.extra_token_num,
@@ -758,35 +765,42 @@ class KDET(DualVit):
                     x, semantics = blk(x, H, W, semantics,
                                        self.extra_token_num,
                                        key_padding_mask, attn_mask)
+                
+                # 如果是当前stage的最后一个block，保存输出用于跨stage残差
+                if j == len(block) - 1 and i < self.num_stages - 1:
+                    # 提取特征部分（去除extra tokens）
+                    stage_feature = x[:, self.extra_token_num:, :].clone()
+                    x_stage, x_ir_stage = stage_feature.chunk(2, dim=1)
+                    stage_residuals[i] = (x_stage, x_ir_stage)
 
             norm = getattr(self, f'norm{i + 1}')
             x = norm(x)
             
-#             print('xxxxxxxx',x.shape)
             extra_token = x[:, :self.extra_token_num, :]
             x = x[:, self.extra_token_num:, :]
-            # 有可能需要变更score_embed和mod_embed
             score_embed = extra_token[:, :score_end_idx, :]
             mod_embed = extra_token[:, score_end_idx:mod_emb_end_idx, :]
 
             if self.score_embed_nums > 1:
                 score_embed = (
                     score_embed[:, 0, :] * x_weight + score_embed[:, 1, :] *
-                    x_ir_weight / (x_weight + x_ir_weight)).unsqueeze(0)
+                    x_ir_weight / (x_weight + x_ir_weight)).unsqueeze(1)
 
             if self.mod_nums > 1:
                 mod_embed = (mod_embed[:, 0, :] * x_weight +
                              mod_embed[:, 1, :] * x_ir_weight /
-                             (x_weight + x_ir_weight)).unsqueeze(0)
+                             (x_weight + x_ir_weight)).unsqueeze(1)
 
             score_weight = self.scorenet[i](score_embed)
             x, x_ir = x.chunk(2, dim=1)
 
-            if i == 1:
-                moe_layer = self.moe_layers[i]
-                x_moe, x_ir_moe = moe_layer(x, x_ir)
-                x = x_moe
-                x_ir = x_ir_moe
+            if i > 0 and (i-1) in stage_residuals:
+                prev_x, prev_x_ir = stage_residuals[i-1]
+                moe_layer = self.cross_stage_moe_layers[i-1]  # stage (i-1) -> stage i
+                
+                residual_x, residual_x_ir = moe_layer(prev_x, prev_x_ir)
+                x = x + self.cross_stage_weights[i-1] * residual_x
+                x_ir = x_ir + self.cross_stage_weights[i-1] * residual_x_ir
 
             x = x * score_weight[0]
             x_ir = x_ir * score_weight[1]
@@ -811,9 +825,9 @@ class KDET(DualVit):
 
         x = torch.cat([x, x_ir], dim=0)
 
-        return x, semantics, tuple(outs)
+        return x, semantics, tuple(outs), stage_residuals
 
-    def forward_merge(self, x, semantics, x_weight, x_ir_weight):
+    def forward_merge(self, x, semantics, x_weight, x_ir_weight, stage_residuals):
         score_start_idx = 0
         score_end_idx = score_start_idx + self.score_embed_nums
         mod_emb_end_idx = score_end_idx + self.mod_nums
@@ -861,9 +875,15 @@ class KDET(DualVit):
                 attn_mask[patches_start_1:patches_end_1,
                           patches_start_1:patches_end_1] = True
 
-            for blk in block:
+            # 处理每个block
+            for j, blk in enumerate(block):
                 x = blk(x, H, W, self.extra_token_num, key_padding_mask,
                         attn_mask)
+                
+                if j == len(block) - 1 and i < self.num_stages - 1:
+                    stage_feature = x[:, patches_start_1:patches_end_2, :].clone()
+                    x_rgb_stage, x_ir_stage = stage_feature.chunk(2, dim=1)
+                    stage_residuals[i] = (x_rgb_stage, x_ir_stage)
 
             if i != self.num_stages - 1:
                 semantics = x[:, patches_end_2:, :]
@@ -881,21 +901,27 @@ class KDET(DualVit):
             if self.score_embed_nums > 1:
                 score_embed = (
                     score_embed[:, 0, :] * x_weight + score_embed[:, 1, :] *
-                    x_ir_weight / (x_weight + x_ir_weight)).unsqueeze(0)
+                    x_ir_weight / (x_weight + x_ir_weight)).unsqueeze(1)
 
             if self.mod_nums > 1:
                 mod_embed = (mod_embed[:, 0, :] * x_weight +
                              mod_embed[:, 1, :] * x_ir_weight /
-                             (x_weight + x_ir_weight)).unsqueeze(0)
+                             (x_weight + x_ir_weight)).unsqueeze(1)
 
             score_weight = self.scorenet[i](score_embed)
             x_rgb, x_ir = x.chunk(2, dim=1)
 
-            if i == 3:
-                moe_layer = self.moe_layers[i]
-                x_moe, x_ir_moe = moe_layer(x, x_ir)
-                x = x_moe
-                x_ir = x_ir_moe
+            # 应用来自前一个stage的MOE残差连接
+            if i > 0 and (i-1) in stage_residuals:
+                prev_x_rgb, prev_x_ir = stage_residuals[i-1]
+                moe_layer = self.cross_stage_moe_layers[i-1]  # stage (i-1) -> stage i
+                
+                # 通过MOE处理前一个stage的输出
+                residual_x_rgb, residual_x_ir = moe_layer(prev_x_rgb, prev_x_ir)
+                
+                # 残差连接
+                x_rgb = x_rgb + self.cross_stage_weights[i-1] * residual_x_rgb
+                x_ir = x_ir + self.cross_stage_weights[i-1] * residual_x_ir
         
             x_rgb = x_rgb * score_weight[0]
             x_ir = x_ir * score_weight[1]
@@ -935,17 +961,19 @@ class KDET(DualVit):
             if flage_x_ir == 0:
                 x_ir_weight = 0 * x_ir_weight
 
-        x, semantics, out1 = self.forward_sep(x, x_ir, x_weight, x_ir_weight)
+        x, semantics, out1, stage_residuals = self.forward_sep(x, x_ir, x_weight, x_ir_weight)
 
-        def inner_forward(x, semantics, x_weight, x_ir_weight):
+        def inner_forward(x, semantics, x_weight, x_ir_weight, stage_residuals):
             out2 = self.forward_merge(
-                x, semantics, x_weight=x_weight, x_ir_weight=x_ir_weight)
+                x, semantics, x_weight=x_weight, x_ir_weight=x_ir_weight, 
+                stage_residuals=stage_residuals)
             return out2
 
         if self.with_cp:
             out2 = checkpoint.checkpoint(
-                inner_forward, x, semantics, x_weight, x_ir_weight)
+                inner_forward, x, semantics, x_weight, x_ir_weight, stage_residuals)
         else:
-            out2 = inner_forward(x, semantics, x_weight, x_ir_weight)
+            out2 = inner_forward(x, semantics, x_weight, x_ir_weight, stage_residuals)
+            
         outs = out1 + out2
         return outs
