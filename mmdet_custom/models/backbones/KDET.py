@@ -520,7 +520,7 @@ class KDET(DualVit):
         self.sep_stage = 2
         
         self.moe_layers = nn.ModuleList([
-            MoELayer(num_experts=2, 
+            MoELayer(num_experts=4, 
                     expert_type='linear')
             for _ in range(num_stages)
         ])
